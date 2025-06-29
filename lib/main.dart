@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart';
 import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:crypto/crypto.dart';
+import 'package:win32/win32.dart'; // 用于调用 SHFileOperation 放入回收站
 
 void main() {
   runApp(const MyApp());
@@ -37,6 +38,7 @@ class _HomePageState extends State<HomePage> {
   String? selectedDir;
   Map<String, List<File>> duplicateGroups = {};
   Set<String> selectedHashes = {};
+
   List<File> allFiles = [];
   int totalFiles = 0;
   int hashedFiles = 0;
@@ -225,9 +227,22 @@ class _HomePageState extends State<HomePage> {
       var files = duplicateGroups[hash]!;
       var original = files.first;
 
+      // var originalStat = original.statSync();
+      var originalMeta = original.resolveSymbolicLinksSync();
+
       for (var duplicate in files.skip(1)) {
+        var duplicateMeta = duplicate.resolveSymbolicLinksSync();
+        // 如果已经指向同一个物理文件路径，跳过
+        if (originalMeta == duplicateMeta) {
+          setState(() {
+            currentFile = '${duplicate.path} 已经与 ${original.path} 链接，跳过';
+          });
+          continue;
+        }
+
         try {
-          duplicate.deleteSync();
+          // duplicate.deleteSync();
+          moveToRecycleBin(duplicate.path); // 使用回收站
           bool ok = createHardLink(duplicate.path, original.path);
           setState(() {
             currentFile = '替换 ${duplicate.path} -> ${original.path} ${ok ? "成功" : "失败"}';
@@ -239,6 +254,18 @@ class _HomePageState extends State<HomePage> {
         }
       }
     }
+  }
+
+  void moveToRecycleBin(String path) {
+    final op =
+        calloc<SHFILEOPSTRUCT>()
+          ..ref.wFunc = FO_DELETE
+          ..ref.pFrom = path.toNativeUtf16()
+          ..ref.fFlags = OFN_ALLOWMULTISELECT | FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
+
+    SHFileOperation(op);
+    calloc.free(op.ref.pFrom);
+    calloc.free(op);
   }
 
   bool createHardLink(String linkPath, String existingFilePath) {
