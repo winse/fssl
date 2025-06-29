@@ -16,8 +16,11 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Hardlink Dedup',
-      theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue), useMaterial3: true),
+      title: 'FSSL - File Space Saving Linking',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        useMaterial3: true,
+      ),
       home: const HomePage(),
     );
   }
@@ -32,51 +35,128 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   String? selectedDir;
-
-  Map<String, List<File>> duplicateGroups = {}; // sha256 -> files
-
-  Set<String> selectedHashes = {}; // hashes selected for merging
-
-  String logText = '';
+  Map<String, List<File>> duplicateGroups = {};
+  Set<String> selectedHashes = {};
+  List<File> allFiles = [];
+  int totalFiles = 0;
+  int hashedFiles = 0;
+  String currentFile = '';
+  double progress = 0;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Hardlink Dedup')),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          children: [
-            Row(children: [Expanded(child: Text(selectedDir ?? '请选择一个目录')), ElevatedButton(onPressed: selectDirectory, child: const Text('选择目录'))]),
-            const SizedBox(height: 10),
-            Expanded(
+      appBar: AppBar(title: const Text('FSSL - Link your clones, save your space')),
+      body: Column(
+        children: [
+          Container(
+            color: Colors.blue.shade50,
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                Expanded(child: Text(selectedDir ?? '请选择一个目录')),
+                ElevatedButton(onPressed: selectDirectory, child: const Text('选择目录')),
+              ],
+            ),
+          ),
+          if (totalFiles > 0)
+            Container(
+              color: Colors.green.shade50,
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('已扫描文件: $hashedFiles / $totalFiles'),
+                  const SizedBox(height: 4),
+                  LinearProgressIndicator(value: progress),
+                  const SizedBox(height: 4),
+                  Text(
+                    '当前: $currentFile',
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: Container(
+              color: Colors.orange.shade50,
               child: ListView(
                 children:
                     duplicateGroups.entries.map((entry) {
                       String hash = entry.key;
                       List<File> files = entry.value;
-                      return CheckboxListTile(
-                        title: Text('共 ${files.length} 个重复文件'),
-                        value: selectedHashes.contains(hash),
-                        onChanged: (checked) {
-                          setState(() {
-                            if (checked == true) {
-                              selectedHashes.add(hash);
-                            } else {
-                              selectedHashes.remove(hash);
-                            }
-                          });
-                        },
-                        subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: files.map((f) => Text(f.path)).toList()),
+                      return Card(
+                        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Checkbox(
+                              value: selectedHashes.contains(hash),
+                              onChanged: (checked) {
+                                setState(() {
+                                  if (checked == true) {
+                                    selectedHashes.add(hash);
+                                  } else {
+                                    selectedHashes.remove(hash);
+                                  }
+                                });
+                              },
+                            ),
+                            Expanded(
+                              child: Padding(
+                                padding: const EdgeInsets.all(8.0),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children:
+                                      files
+                                          .map(
+                                            (f) => Text(
+                                              f.path,
+                                              style: const TextStyle(
+                                                fontSize: 12,
+                                                color: Colors.blue,
+                                                decoration: TextDecoration.underline,
+                                              ),
+                                            ),
+                                          )
+                                          .toList(),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       );
                     }).toList(),
               ),
             ),
-            ElevatedButton(onPressed: performDedup, child: const Text('执行硬链接合并')),
-            const SizedBox(height: 10),
-            Expanded(child: SingleChildScrollView(child: Text(logText))),
-          ],
-        ),
+          ),
+          Container(
+            color: Colors.grey.shade100,
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      if (selectedHashes.length < duplicateGroups.length) {
+                        selectedHashes = duplicateGroups.keys.toSet();
+                      } else {
+                        selectedHashes.clear();
+                      }
+                    });
+                  },
+                  child: const Text('全选 / 取消全选'),
+                ),
+                const Spacer(),
+                ElevatedButton(
+                  onPressed: performDedup,
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                  child: const Text('执行硬链接合并'),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -88,27 +168,39 @@ class _HomePageState extends State<HomePage> {
         selectedDir = path;
         duplicateGroups.clear();
         selectedHashes.clear();
-        logText = '';
+        allFiles.clear();
+        totalFiles = 0;
+        hashedFiles = 0;
+        currentFile = '';
+        progress = 0;
       });
-      await scanDirectory(Directory(path));
+      await computeHashesWithScan(Directory(path));
     }
   }
 
-  Future<void> scanDirectory(Directory dir) async {
+  Future<void> computeHashesWithScan(Directory dir) async {
     Map<int, List<File>> sizeMap = {};
-
-    await for (var entity in dir.list(recursive: true, followLinks: false)) {
-      if (entity is File) {
-        int size = await entity.length();
-        sizeMap.putIfAbsent(size, () => []).add(entity);
-      }
-    }
-
     Map<String, List<File>> hashMap = {};
+    var files =
+        await dir
+            .list(recursive: true, followLinks: false)
+            .where((e) => e is File)
+            .cast<File>()
+            .toList();
+    totalFiles = files.length;
 
-    for (var files in sizeMap.values) {
-      if (files.length < 2) continue;
-      for (var file in files) {
+    for (var i = 0; i < files.length; i++) {
+      var file = files[i];
+      setState(() {
+        currentFile = file.path;
+        hashedFiles = i + 1;
+        progress = (i + 1) / totalFiles;
+      });
+
+      int size = await file.length();
+      sizeMap.putIfAbsent(size, () => []).add(file);
+
+      if (sizeMap[size]!.length > 1) {
         String hash = await sha256OfFile(file);
         hashMap.putIfAbsent(hash, () => []).add(file);
       }
@@ -119,6 +211,7 @@ class _HomePageState extends State<HomePage> {
         for (var e in hashMap.entries)
           if (e.value.length > 1) e.key: e.value,
       };
+      currentFile = '扫描完成';
     });
   }
 
@@ -137,24 +230,23 @@ class _HomePageState extends State<HomePage> {
           duplicate.deleteSync();
           bool ok = createHardLink(duplicate.path, original.path);
           setState(() {
-            logText += '替换 ${duplicate.path} -> ${original.path} ${ok ? "成功" : "失败"}\n';
+            currentFile = '替换 ${duplicate.path} -> ${original.path} ${ok ? "成功" : "失败"}';
           });
         } catch (e) {
           setState(() {
-            logText += '错误 ${duplicate.path}: $e\n';
+            currentFile = '错误 ${duplicate.path}: $e';
           });
         }
       }
     }
   }
 
-  // FFI 调用 Windows API
   bool createHardLink(String linkPath, String existingFilePath) {
     final kernel32 = DynamicLibrary.open('kernel32.dll');
-    final CreateHardLink = kernel32
-        .lookupFunction<Int32 Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>), int Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>)>(
-          'CreateHardLinkW',
-        );
+    final CreateHardLink = kernel32.lookupFunction<
+      Int32 Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>),
+      int Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>)
+    >('CreateHardLinkW');
 
     final link = linkPath.toNativeUtf16();
     final target = existingFilePath.toNativeUtf16();
