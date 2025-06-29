@@ -1,11 +1,11 @@
-import 'dart:io';
-import 'dart:convert';
 import 'dart:ffi';
-import 'package:ffi/ffi.dart';
-import 'package:flutter/material.dart';
-import 'package:file_selector/file_selector.dart';
+import 'dart:io';
+
 import 'package:crypto/crypto.dart';
-import 'package:url_launcher/url_launcher.dart';
+import 'package:ffi/ffi.dart';
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
+import 'package:path/path.dart';
 import 'package:win32/win32.dart' as win32; // 用于调用 SHFileOperation 放入回收站
 
 void main() {
@@ -44,6 +44,7 @@ class _HomePageState extends State<HomePage> {
   String _currentState = '';
   double progress = 0;
 
+  bool _stageFinished = false;
   bool _forceDelete = false;
 
   @override
@@ -160,7 +161,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 ElevatedButton(
                   onPressed:
-                      stageFinished
+                      _stageFinished
                           ? () {
                             if (selected.length < duplicateGroups.length) {
                               selected = duplicateGroups.keys.toSet();
@@ -188,7 +189,7 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(width: 8.0),
                 ElevatedButton(
                   onPressed:
-                      stageFinished && selected.isNotEmpty
+                      _stageFinished && selected.isNotEmpty
                           ? () async {
                             await performDedup();
 
@@ -227,10 +228,6 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  bool get stageFinished {
-    return progress == 1;
-  }
-
   Future<void> selectDirectory() async {
     final path = await getDirectoryPath();
     if (path != null) {
@@ -241,6 +238,7 @@ class _HomePageState extends State<HomePage> {
       total = 0;
       handled = 0;
       progress = 0;
+      _stageFinished = false;
       _updateState("初始化...");
       await computeHashesWithScan(Directory(path));
     }
@@ -251,7 +249,7 @@ class _HomePageState extends State<HomePage> {
 
     var files =
         await dir.list(recursive: true, followLinks: false).where((e) => e is File).cast<File>().toList();
-    files.sort((a, b) => a.path.compareTo(b.path));
+    files.sort((a, b) => basenameWithoutExtension(a.path).compareTo(basenameWithoutExtension(b.path)));
 
     total = files.length;
 
@@ -280,7 +278,9 @@ class _HomePageState extends State<HomePage> {
       for (var e in hashedFileMap.entries)
         if (e.value.length > 1) e.key: e.value,
     };
-    _updateState('扫描完成');
+
+    _stageFinished = true;
+    _updateState('扫描完成, 共找到 ${duplicateGroups.length} 组重复文件。');
   }
 
   Future<String> sha256OfFile(File file) async {
@@ -308,7 +308,10 @@ class _HomePageState extends State<HomePage> {
       for (var duplicate in files.groupSourceFiles) {
         try {
           // duplicate.deleteSync();
-          moveToRecycleBin(duplicate.path); // 使用回收站
+          // 确保删除
+          while (duplicate.existsSync()) {
+            moveToRecycleBin(duplicate.path); // 使用回收站
+          }
 
           bool ok = createHardLink(duplicate.path, original.path);
 
@@ -319,37 +322,46 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
+    _stageFinished = true;
     _updateState('合并完成');
   }
 
   void moveToRecycleBin(String path) {
+    final pForm = path.toNativeUtf16();
     final op =
         calloc<win32.SHFILEOPSTRUCT>()
           ..ref.wFunc = win32.FO_DELETE
-          ..ref.pFrom = path.toNativeUtf16()
+          ..ref.pFrom = pForm
           ..ref.fFlags = win32.OFN_ALLOWMULTISELECT | win32.FOF_ALLOWUNDO | win32.FOF_NOCONFIRMATION;
 
-    win32.SHFileOperation(op);
-    calloc.free(op.ref.pFrom);
-    calloc.free(op);
+    try {
+      win32.SHFileOperation(op);
+    } finally {
+      calloc.free(pForm);
+      calloc.free(op);
+    }
   }
+
+  final DynamicLibrary _kernel32 = DynamicLibrary.open('kernel32.dll');
 
   bool createHardLink(String linkPath, String existingFilePath) {
     final link = linkPath.toNativeUtf16();
     final target = existingFilePath.toNativeUtf16();
 
-    final kernel32 = DynamicLibrary.open('kernel32.dll');
-    final CreateHardLink = kernel32.lookupFunction<
-      Int32 Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>),
-      int Function(Pointer<Utf16>, Pointer<Utf16>, Pointer<Void>)
-    >('CreateHardLinkW');
-    final result = CreateHardLink(link, target, nullptr) != 0;
-    // final result = win32.CreateSymbolicLink(link, target, 0); // 0x0 表示是文件符号链接
+    try {
+      // win32.CreateHardLink
+      final createHardLinkPtr = _kernel32.lookupFunction<CreateHardLinkFunc, CreateHardLink>(
+        'CreateHardLinkW',
+      );
+      final result = createHardLinkPtr(link, target, nullptr) != 0;
+      // 不能用软连接。软连接就得确定一个根！
+      // final result = win32.CreateSymbolicLink(link, target, 0); // 0x0 表示是文件符号链接
 
-    calloc.free(link);
-    calloc.free(target);
-
-    return result != 0;
+      return result != 0;
+    } finally {
+      calloc.free(link);
+      calloc.free(target);
+    }
   }
 
   bool isSameFileid(File f1, File f2) {
@@ -371,31 +383,51 @@ class _HomePageState extends State<HomePage> {
       }
 
       final info = calloc<win32.BY_HANDLE_FILE_INFORMATION>();
-      final success = win32.GetFileInformationByHandle(hFile, info) != 0;
 
-      Map<String, int>? result;
-      if (success) {
-        result = {
-          'volume': info.ref.dwVolumeSerialNumber,
-          'indexHigh': info.ref.nFileIndexHigh,
-          'indexLow': info.ref.nFileIndexLow,
-        };
+      try {
+        final success = win32.GetFileInformationByHandle(hFile, info) != 0;
+
+        Map<String, int>? result;
+        if (success) {
+          result = {
+            'volume': info.ref.dwVolumeSerialNumber,
+            'indexHigh': info.ref.nFileIndexHigh,
+            'indexLow': info.ref.nFileIndexLow,
+          };
+        }
+
+        return result;
+      } finally {
+        calloc.free(info);
+        win32.CloseHandle(hFile);
       }
-
-      calloc.free(info);
-      win32.CloseHandle(hFile);
-      return result;
     }
 
     final info1 = _getFileInfo(f1.path);
     final info2 = _getFileInfo(f2.path);
 
     if (info1 == null || info2 == null) return false;
+    // 组合 FileIndexHigh 和 FileIndexLow 作为唯一标识
+    // return (fileInfo.ref.FileIndexHigh << 32) + fileInfo.ref.FileIndexLow;
     return info1['volume'] == info2['volume'] &&
         info1['indexHigh'] == info2['indexHigh'] &&
         info1['indexLow'] == info2['indexLow'];
   }
 }
+
+typedef CreateHardLinkFunc =
+    Int32 Function(
+      Pointer<Utf16> lpFileName,
+      Pointer<Utf16> lpExistingFileName,
+      Pointer<Void> lpSecurityAttributes,
+    );
+
+typedef CreateHardLink =
+    int Function(
+      Pointer<Utf16> lpFileName,
+      Pointer<Utf16> lpExistingFileName,
+      Pointer<Void> lpSecurityAttributes,
+    );
 
 class HoverCheckboxLabel extends StatefulWidget {
   final bool value;
